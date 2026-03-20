@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cortex-mcp"
+version = "0.1.0"
+description = "MCP server that lets AI agents monitor and tune neural network training in real time"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.scripts]
+cortex = "cortex.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cortex"]

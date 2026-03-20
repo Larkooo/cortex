@@ -91,14 +91,35 @@ async def list_tools():
         ),
         Tool(
             name="save_checkpoint",
-            description="Request the training loop to save a checkpoint with the given tag",
+            description="Request the training loop to save a checkpoint with the given tag. Use this proactively when metrics look good, so you can rollback later if things go wrong.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "tag": {"type": "string", "description": "Checkpoint tag/name"},
+                    "tag": {"type": "string", "description": "Checkpoint tag/name (e.g., 'before_lr_change', 'best_eval')"},
                 },
                 "required": ["tag"],
             },
+        ),
+        Tool(
+            name="rollback",
+            description="Roll back model weights to a previously saved checkpoint. Use this when training has diverged (NaN loss, entropy collapse, eval score crashed). The model is restored but training continues from the current step count — only the weights are reverted.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string", "description": "Checkpoint tag to roll back to (from list_checkpoints)"},
+                },
+                "required": ["tag"],
+            },
+        ),
+        Tool(
+            name="pause_training",
+            description="Pause training so you can analyze metrics and decide what to adjust. Training resumes when you call resume_training.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="resume_training",
+            description="Resume training after a pause.",
+            inputSchema={"type": "object", "properties": {}},
         ),
     ]
 
@@ -133,6 +154,27 @@ async def call_tool(name: str, arguments: dict):
         tag = arguments["tag"]
         tracker.set_override("__save_checkpoint__", tag)
         result = {"status": "queued", "tag": tag}
+    elif name == "rollback":
+        tag = arguments["tag"]
+        checkpoints = tracker.get_checkpoints()
+        if tag not in checkpoints:
+            result = {"error": f"Checkpoint '{tag}' not found", "available": list(checkpoints.keys())}
+        else:
+            tracker.set_override("__rollback__", tag)
+            cp = checkpoints[tag]
+            result = {
+                "status": "queued",
+                "tag": tag,
+                "rolling_back_to_step": cp["step"],
+                "metrics_at_checkpoint": cp["metrics"],
+                "note": "Model weights will be restored on next training step. Training continues from current step count.",
+            }
+    elif name == "pause_training":
+        tracker.set_override("__pause__", True)
+        result = {"status": "paused", "note": "Training will pause after current step. Call resume_training to continue."}
+    elif name == "resume_training":
+        tracker.set_override("__resume__", True)
+        result = {"status": "resumed"}
     else:
         result = {"error": f"Unknown tool: {name}"}
 

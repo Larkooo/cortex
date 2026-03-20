@@ -1,18 +1,5 @@
 """
-Cortex MCP Server — exposes training metrics and controls to AI agents.
-
-Tools:
-    get_status          - current step, progress, ETA, phase
-    get_metrics         - latest values of all tracked metrics
-    get_metric_history  - time series for a specific metric
-    get_config          - training configuration/hyperparameters
-    list_checkpoints    - saved checkpoints
-    adjust_param        - override a hyperparameter mid-training
-    save_checkpoint     - tell the training loop to save a checkpoint
-
-Resources:
-    training://status   - live training status
-    training://config   - hyperparameter configuration
+Cortex MCP Server — exposes training metrics, detectors, and guarded controls to AI agents.
 """
 
 import json
@@ -20,17 +7,15 @@ import logging
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import (
-    TextContent,
-    Tool,
-    Resource,
-)
+from mcp.types import TextContent, Tool, Resource
 
 from cortex.tracker import tracker
+from cortex.detectors import run_all as run_detectors
+from cortex.guardrails import Guardrails, GuardrailConfig
 
 logger = logging.getLogger("cortex")
-
 server = Server("cortex")
+guardrails = Guardrails(tracker)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -40,80 +25,92 @@ server = Server("cortex")
 @server.list_tools()
 async def list_tools():
     return [
+        # ── Observe ──
         Tool(
             name="get_status",
-            description="Get current training status: step, progress percentage, ETA, steps/sec, phase",
+            description="Get current training status: step, progress %, ETA, steps/sec, phase.",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="get_metrics",
-            description="Get the latest value of all tracked metrics (loss, entropy, eval scores, etc.)",
+            description="Get the latest value of all tracked metrics (loss, entropy, eval scores, etc.).",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="get_metric_history",
-            description="Get the time series history for a specific metric. Use this to analyze trends.",
+            description="Get time series history for a specific metric. Use this to analyze trends, detect patterns, and compare before/after an intervention.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "metric": {"type": "string", "description": "Metric name (e.g., 'loss', 'entropy', 'eval_score')"},
-                    "last_n": {"type": "integer", "description": "Only return the last N data points. 0 = all.", "default": 50},
+                    "last_n": {"type": "integer", "description": "Return the last N data points (default: 50)", "default": 50},
                 },
                 "required": ["metric"],
             },
         ),
         Tool(
             name="get_config",
-            description="Get training configuration and hyperparameters (lr, batch_size, etc.)",
+            description="Get training configuration and hyperparameters.",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="list_metrics",
-            description="List all metric names being tracked",
+            description="List all metric names being tracked.",
             inputSchema={"type": "object", "properties": {}},
         ),
+
+        # ── Detect ──
         Tool(
-            name="list_checkpoints",
-            description="List all saved checkpoints with their step, time, and metrics at save time",
+            name="diagnose",
+            description="Run all anomaly detectors on the current training state. Returns structured findings with severity, explanation, and recommended action. Use this regularly to check training health.",
             inputSchema={"type": "object", "properties": {}},
         ),
+
+        # ── Intervene ──
         Tool(
             name="adjust_param",
-            description="Override a hyperparameter mid-training. The training loop will pick this up on the next step. Common params: lr, ent_coef, vf_coef, clip_eps.",
+            description="Adjust a hyperparameter mid-training. Subject to guardrails: max % change, cooldown between adjustments, and checkpoint requirement. Always provide a reason.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Parameter name (e.g., 'lr', 'ent_coef')"},
+                    "name": {"type": "string", "description": "Parameter name (e.g., 'lr', 'ent_coef', 'vf_coef', 'clip_eps')"},
                     "value": {"type": "number", "description": "New value"},
+                    "reason": {"type": "string", "description": "Why you're making this change (logged for review)"},
                 },
-                "required": ["name", "value"],
+                "required": ["name", "value", "reason"],
             },
         ),
         Tool(
             name="save_checkpoint",
-            description="Request the training loop to save a checkpoint with the given tag. Use this proactively when metrics look good, so you can rollback later if things go wrong.",
+            description="Save a checkpoint of the current model state. Always do this before making adjustments, so you can rollback if things go wrong.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "tag": {"type": "string", "description": "Checkpoint tag/name (e.g., 'before_lr_change', 'best_eval')"},
+                    "tag": {"type": "string", "description": "Checkpoint name (e.g., 'before_lr_change', 'best_eval', 'healthy_entropy')"},
                 },
                 "required": ["tag"],
             },
         ),
         Tool(
             name="rollback",
-            description="Roll back model weights to a previously saved checkpoint. Use this when training has diverged (NaN loss, entropy collapse, eval score crashed). The model is restored but training continues from the current step count — only the weights are reverted.",
+            description="Restore model weights to a previously saved checkpoint. Use when training has diverged, entropy collapsed, or eval crashed. Weights are restored but step count continues.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "tag": {"type": "string", "description": "Checkpoint tag to roll back to (from list_checkpoints)"},
+                    "tag": {"type": "string", "description": "Checkpoint tag to restore (from list_checkpoints)"},
+                    "reason": {"type": "string", "description": "Why you're rolling back"},
                 },
-                "required": ["tag"],
+                "required": ["tag", "reason"],
             },
         ),
         Tool(
+            name="list_checkpoints",
+            description="List all saved checkpoints with their step, metrics at save time, and metadata.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
             name="pause_training",
-            description="Pause training so you can analyze metrics and decide what to adjust. Training resumes when you call resume_training.",
+            description="Pause the training loop. Use this when you need time to analyze metrics and plan interventions. Training blocks until you call resume_training.",
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
@@ -121,64 +118,138 @@ async def list_tools():
             description="Resume training after a pause.",
             inputSchema={"type": "object", "properties": {}},
         ),
+
+        # ── Review ──
+        Tool(
+            name="get_intervention_log",
+            description="Get the log of all interventions (param changes, rollbacks, checkpoints) with before/after metrics and reasons.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "last_n": {"type": "integer", "description": "Return last N entries (default: all)", "default": 0},
+                },
+            },
+        ),
+        Tool(
+            name="get_guardrail_status",
+            description="Check current guardrail state: rate limits, cooldowns, intervention count.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
     ]
 
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    result = _handle_tool(name, arguments)
+    return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+
+
+def _handle_tool(name: str, arguments: dict) -> dict:
+    # ── Observe ──
     if name == "get_status":
-        result = tracker.get_status()
+        return tracker.get_status()
+
     elif name == "get_metrics":
-        result = tracker.get_latest()
+        return tracker.get_latest()
+
     elif name == "get_metric_history":
         metric = arguments["metric"]
         last_n = arguments.get("last_n", 50)
         history = tracker.get_history(metric, last_n)
         if not history:
-            available = tracker.get_metric_names()
-            result = {"error": f"Metric '{metric}' not found", "available_metrics": available}
-        else:
-            result = {"metric": metric, "count": len(history), "data": history}
+            return {"error": f"Metric '{metric}' not found", "available_metrics": tracker.get_metric_names()}
+        return {"metric": metric, "count": len(history), "data": history}
+
     elif name == "get_config":
-        result = tracker.get_config()
+        return tracker.get_config()
+
     elif name == "list_metrics":
-        result = {"metrics": tracker.get_metric_names()}
-    elif name == "list_checkpoints":
-        result = tracker.get_checkpoints()
+        return {"metrics": tracker.get_metric_names()}
+
+    # ── Detect ──
+    elif name == "diagnose":
+        findings = run_detectors(tracker)
+        if not findings:
+            return {"status": "healthy", "findings": [], "message": "No anomalies detected."}
+        return {
+            "status": "issues_detected",
+            "count": len(findings),
+            "findings": [f.to_dict() for f in findings],
+        }
+
+    # ── Intervene ──
     elif name == "adjust_param":
         param_name = arguments["name"]
         value = arguments["value"]
+        reason = arguments.get("reason", "")
+
+        # Guardrail check
+        check = guardrails.validate_adjustment(param_name, value, reason)
+        if not check["allowed"]:
+            return {"status": "blocked", "error": check["error"]}
+
+        # Record and apply
+        guardrails.record_intervention(
+            action="adjust_param", param=param_name,
+            old_value=check.get("old_value"), new_value=value, reason=reason,
+        )
         tracker.set_override(param_name, value)
-        result = {"status": "queued", "param": param_name, "value": value, "note": "Will take effect on next training step"}
+
+        result = {"status": "applied", "param": param_name, "old_value": check.get("old_value"),
+                  "new_value": value, "reason": reason}
+        if check.get("warnings"):
+            result["warnings"] = check["warnings"]
+        return result
+
     elif name == "save_checkpoint":
         tag = arguments["tag"]
         tracker.set_override("__save_checkpoint__", tag)
-        result = {"status": "queued", "tag": tag}
+        guardrails.record_intervention(action="save_checkpoint", param=tag, reason="agent requested")
+        return {"status": "queued", "tag": tag}
+
     elif name == "rollback":
         tag = arguments["tag"]
+        reason = arguments.get("reason", "")
         checkpoints = tracker.get_checkpoints()
         if tag not in checkpoints:
-            result = {"error": f"Checkpoint '{tag}' not found", "available": list(checkpoints.keys())}
-        else:
-            tracker.set_override("__rollback__", tag)
-            cp = checkpoints[tag]
-            result = {
-                "status": "queued",
-                "tag": tag,
-                "rolling_back_to_step": cp["step"],
-                "metrics_at_checkpoint": cp["metrics"],
-                "note": "Model weights will be restored on next training step. Training continues from current step count.",
-            }
+            return {"error": f"Checkpoint '{tag}' not found", "available": list(checkpoints.keys())}
+
+        tracker.set_override("__rollback__", tag)
+        cp = checkpoints[tag]
+        guardrails.record_intervention(
+            action="rollback", param=tag,
+            old_value=tracker.get_status()["step"], new_value=cp["step"], reason=reason,
+        )
+        return {
+            "status": "queued", "tag": tag,
+            "restoring_to_step": cp["step"],
+            "metrics_at_checkpoint": cp["metrics"],
+            "reason": reason,
+        }
+
+    elif name == "list_checkpoints":
+        return tracker.get_checkpoints()
+
     elif name == "pause_training":
         tracker.set_override("__pause__", True)
-        result = {"status": "paused", "note": "Training will pause after current step. Call resume_training to continue."}
+        guardrails.record_intervention(action="pause", reason="agent requested")
+        return {"status": "paused"}
+
     elif name == "resume_training":
         tracker.set_override("__resume__", True)
-        result = {"status": "resumed"}
-    else:
-        result = {"error": f"Unknown tool: {name}"}
+        guardrails.record_intervention(action="resume", reason="agent requested")
+        return {"status": "resumed"}
 
-    return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+    # ── Review ──
+    elif name == "get_intervention_log":
+        last_n = arguments.get("last_n", 0)
+        return {"interventions": guardrails.get_log(last_n)}
+
+    elif name == "get_guardrail_status":
+        return guardrails.get_summary()
+
+    else:
+        return {"error": f"Unknown tool: {name}"}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -188,18 +259,12 @@ async def call_tool(name: str, arguments: dict):
 @server.list_resources()
 async def list_resources():
     return [
-        Resource(
-            uri="training://status",
-            name="Training Status",
-            description="Live training status including step, progress, ETA",
-            mimeType="application/json",
-        ),
-        Resource(
-            uri="training://config",
-            name="Training Config",
-            description="Hyperparameter configuration",
-            mimeType="application/json",
-        ),
+        Resource(uri="training://status", name="Training Status",
+                 description="Live training status + latest metrics", mimeType="application/json"),
+        Resource(uri="training://config", name="Training Config",
+                 description="Hyperparameter configuration", mimeType="application/json"),
+        Resource(uri="training://diagnosis", name="Training Diagnosis",
+                 description="Current anomaly detection findings", mimeType="application/json"),
     ]
 
 
@@ -211,8 +276,10 @@ async def read_resource(uri: str):
         return json.dumps(status, indent=2, default=str)
     elif uri == "training://config":
         return json.dumps(tracker.get_config(), indent=2, default=str)
-    else:
-        return json.dumps({"error": f"Unknown resource: {uri}"})
+    elif uri == "training://diagnosis":
+        findings = run_detectors(tracker)
+        return json.dumps({"findings": [f.to_dict() for f in findings]}, indent=2, default=str)
+    return json.dumps({"error": f"Unknown resource: {uri}"})
 
 
 # ──────────────────────────────────────────────────────────────

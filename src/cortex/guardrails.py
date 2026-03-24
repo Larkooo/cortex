@@ -60,6 +60,17 @@ class Guardrails:
         """Validate a parameter adjustment. Returns {"allowed": True/False, ...}."""
         now = time.time()
         result = {"allowed": True, "warnings": [], "param": param, "new_value": new_value}
+        tunable_params = {entry["name"]: entry for entry in self.tracker.get_tunable_params()}
+        param_spec = tunable_params.get(param)
+
+        if not param_spec:
+            result["allowed"] = False
+            result["error"] = (
+                f"Parameter '{param}' is not registered as runtime-tunable. "
+                "The training loop must declare allowed knobs with tracker.define_param(...)."
+            )
+            result["allowed_params"] = list(tunable_params.keys())
+            return result
 
         # Check checkpoint requirement
         if self.config.require_checkpoint_before_action:
@@ -86,18 +97,39 @@ class Guardrails:
             return result
 
         # Check max change percentage
-        current = self.tracker.get_latest().get(param) or self.tracker.get_config().get(param)
+        latest = self.tracker.get_latest()
+        config = self.tracker.get_config()
+        if param in latest:
+            current = latest[param]
+        else:
+            current = config.get(param)
+
+        min_value = param_spec.get("min_value")
+        if min_value is not None and new_value < min_value:
+            result["allowed"] = False
+            result["error"] = f"Value too small for '{param}': {new_value} < {min_value}."
+            return result
+
+        max_value = param_spec.get("max_value")
+        if max_value is not None and new_value > max_value:
+            result["allowed"] = False
+            result["error"] = f"Value too large for '{param}': {new_value} > {max_value}."
+            return result
+
+        max_change_pct = param_spec.get("max_change_pct", self.config.max_change_pct)
+        if max_change_pct is None:
+            max_change_pct = self.config.max_change_pct
         if current is not None and current != 0:
             change_pct = abs(new_value - current) / abs(current) * 100
-            if change_pct > self.config.max_change_pct:
+            if change_pct > max_change_pct:
                 result["allowed"] = False
                 result["error"] = (
                     f"Change too large: {param} {current} → {new_value} is a {change_pct:.0f}% change. "
-                    f"Max allowed is {self.config.max_change_pct:.0f}%. Make smaller incremental adjustments."
+                    f"Max allowed is {max_change_pct:.0f}%. Make smaller incremental adjustments."
                 )
                 return result
-            if change_pct > self.config.max_change_pct * 0.7:
-                result["warnings"].append(f"Large change: {change_pct:.0f}% (limit is {self.config.max_change_pct:.0f}%)")
+            if change_pct > max_change_pct * 0.7:
+                result["warnings"].append(f"Large change: {change_pct:.0f}% (limit is {max_change_pct:.0f}%)")
 
         result["old_value"] = current
         return result

@@ -43,9 +43,12 @@ class Tracker:
         self._phase: str = "idle"
         self._checkpoints: dict[str, dict] = {}
         self._param_overrides: dict[str, Any] = {}  # set by MCP, read by training loop
+        self._tunable_params: dict[str, dict[str, Any]] = {}
         self._rollback_handler: Callable = None  # user-provided rollback function
         self._checkpoint_handler: Callable = None  # user-provided save function
+        self._eval_handler: Callable = None  # user-provided eval function
         self._paused = False
+        self._eval_runs: list[dict[str, Any]] = []
 
     def config(self, total_steps: int = 0, **kwargs):
         """Set training configuration. Call once at start."""
@@ -53,6 +56,27 @@ class Tracker:
             self._config.update(kwargs)
             self._total_steps = total_steps
             self._start_time = time.time()
+
+    def define_param(self, name: str, *, description: str = "", min_value: float = None,
+                     max_value: float = None, max_change_pct: float = None):
+        """Declare a runtime-tunable training parameter.
+
+        Training code should call this for any knob the agent is allowed to change.
+        This keeps Cortex generic across RL, transformers, LLM finetuning, etc.
+        """
+        with self._lock:
+            self._tunable_params[name] = {
+                "name": name,
+                "description": description,
+                "min_value": min_value,
+                "max_value": max_value,
+                "max_change_pct": max_change_pct,
+            }
+
+    def define_params(self, *params: dict[str, Any]):
+        """Declare multiple runtime-tunable parameters."""
+        for param in params:
+            self.define_param(**param)
 
     def log(self, step: int = None, **metrics):
         """Log one or more metrics at the current step.
@@ -65,6 +89,8 @@ class Tracker:
         with self._lock:
             if step is not None:
                 self._step = step
+            else:
+                self._step += 1
             for name, value in metrics.items():
                 self._metrics[name].append((self._step, float(value), now))
                 self._latest[name] = float(value)
@@ -111,6 +137,20 @@ class Tracker:
         self._rollback_handler = handler
         return handler
 
+    def on_eval(self, handler: Callable):
+        """Register a callback for on-demand evaluation requests.
+
+        The handler receives a request dict and should return a JSON-serializable
+        result dict, for example:
+
+            @tracker.on_eval
+            def run_eval(request):
+                episodes = request.get("episodes", 100)
+                return {"episodes": episodes, "eval_score": evaluate(episodes)}
+        """
+        self._eval_handler = handler
+        return handler
+
     def get_override(self, name: str, default=None):
         """Check if the MCP agent has overridden a parameter.
 
@@ -146,18 +186,11 @@ class Tracker:
         # Handle rollback requests
         tag = self.get_override("__rollback__")
         if tag:
-            if self._rollback_handler:
-                success = self._rollback_handler(tag)
-                if success:
-                    with self._lock:
-                        cp = self._checkpoints.get(tag)
-                        if cp:
-                            self._step = cp["step"]
-                    events["rollback"] = tag
-                else:
-                    events["rollback_failed"] = tag
-            else:
-                events["rollback_no_handler"] = tag
+            events.update(self._process_rollback(tag))
+
+        request = self.get_override("__run_eval__")
+        if request:
+            events.update(self._process_eval(request))
 
         # Handle pause/resume
         if self.get_override("__pause__"):
@@ -178,14 +211,54 @@ class Tracker:
                 events["resumed"] = True
                 break
             # Also check for param adjustments while paused
-            if self.get_override("__rollback__"):
-                # Handle rollback while paused
-                tag = self._param_overrides.get("__rollback__")
-                if tag and self._rollback_handler:
-                    self._rollback_handler(tag)
-                    events["rollback"] = tag
+            tag = self.get_override("__rollback__")
+            if tag:
+                events.update(self._process_rollback(tag))
+            request = self.get_override("__run_eval__")
+            if request:
+                events.update(self._process_eval(request))
 
         return events
+
+    def _process_rollback(self, tag: str) -> dict:
+        if self._rollback_handler:
+            success = self._rollback_handler(tag)
+            if success:
+                with self._lock:
+                    cp = self._checkpoints.get(tag)
+                    if cp:
+                        self._step = cp["step"]
+                return {"rollback": tag}
+            return {"rollback_failed": tag}
+        return {"rollback_no_handler": tag}
+
+    def _process_eval(self, request: dict[str, Any]) -> dict:
+        request_id = request.get("id", f"eval-{int(time.time() * 1000)}")
+        if not self._eval_handler:
+            result = {
+                "id": request_id,
+                "status": "failed",
+                "error": "No eval handler registered",
+                "request": dict(request),
+                "step": self._step,
+                "time": time.time(),
+            }
+            with self._lock:
+                self._eval_runs.append(result)
+            return {"eval_failed": request_id}
+
+        outcome = self._eval_handler(dict(request))
+        result = {
+            "id": request_id,
+            "status": "completed",
+            "request": dict(request),
+            "result": outcome or {},
+            "step": self._step,
+            "time": time.time(),
+        }
+        with self._lock:
+            self._eval_runs.append(result)
+        return {"eval_completed": request_id}
 
     # ── Read methods (used by MCP server) ──
 
@@ -204,6 +277,7 @@ class Tracker:
                 "progress": round(self._step / self._total_steps, 4) if self._total_steps > 0 else 0,
                 "has_rollback_handler": self._rollback_handler is not None,
                 "has_checkpoint_handler": self._checkpoint_handler is not None,
+                "has_eval_handler": self._eval_handler is not None,
             }
 
     def get_config(self) -> dict:
@@ -229,6 +303,17 @@ class Tracker:
         with self._lock:
             return dict(self._checkpoints)
 
+    def get_tunable_params(self) -> list[dict]:
+        with self._lock:
+            return [dict(param) for param in self._tunable_params.values()]
+
+    def get_eval_runs(self, last_n: int = 0) -> list[dict]:
+        with self._lock:
+            runs = self._eval_runs
+            if last_n > 0:
+                runs = runs[-last_n:]
+            return [dict(run) for run in runs]
+
     def set_override(self, name: str, value: Any):
         """Called by MCP server to queue a parameter change."""
         with self._lock:
@@ -246,6 +331,8 @@ class Tracker:
             self._phase = "idle"
             self._checkpoints.clear()
             self._param_overrides.clear()
+            self._tunable_params.clear()
+            self._eval_runs.clear()
 
 
 # Global singleton — training code imports this

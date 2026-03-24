@@ -4,6 +4,7 @@ Cortex MCP Server — exposes training metrics, detectors, and guarded controls 
 
 import json
 import logging
+import time
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -54,6 +55,11 @@ async def list_tools():
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
+            name="get_tunable_params",
+            description="List the runtime-tunable parameters declared by the training loop.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
             name="list_metrics",
             description="List all metric names being tracked.",
             inputSchema={"type": "object", "properties": {}},
@@ -69,11 +75,11 @@ async def list_tools():
         # ── Intervene ──
         Tool(
             name="adjust_param",
-            description="Adjust a hyperparameter mid-training. Subject to guardrails: max % change, cooldown between adjustments, and checkpoint requirement. Always provide a reason.",
+            description="Adjust a runtime-tunable parameter declared by the training loop. Subject to guardrails: registry, bounds, max % change, cooldown between adjustments, and checkpoint requirement. Always provide a reason.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Parameter name (e.g., 'lr', 'ent_coef', 'vf_coef', 'clip_eps')"},
+                    "name": {"type": "string", "description": "Registered parameter name (for example 'lr', 'dropout', 'weight_decay', or 'label_smoothing')"},
                     "value": {"type": "number", "description": "New value"},
                     "reason": {"type": "string", "description": "Why you're making this change (logged for review)"},
                 },
@@ -114,6 +120,18 @@ async def list_tools():
             inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
+            name="run_eval",
+            description="Request an evaluation run from the training loop. Use this after a checkpoint or parameter change to decide whether to keep or rollback.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "episodes": {"type": "integer", "description": "Number of eval episodes to run", "default": 100},
+                    "tag": {"type": "string", "description": "Short label for the eval run"},
+                    "reason": {"type": "string", "description": "Why you're requesting this eval"},
+                },
+            },
+        ),
+        Tool(
             name="resume_training",
             description="Resume training after a pause.",
             inputSchema={"type": "object", "properties": {}},
@@ -134,6 +152,16 @@ async def list_tools():
             name="get_guardrail_status",
             description="Check current guardrail state: rate limits, cooldowns, intervention count.",
             inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="get_eval_runs",
+            description="Get the recent on-demand evaluation runs requested through MCP.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "last_n": {"type": "integer", "description": "Return last N eval runs (default: all)", "default": 0},
+                },
+            },
         ),
     ]
 
@@ -163,6 +191,9 @@ def _handle_tool(name: str, arguments: dict) -> dict:
     elif name == "get_config":
         return tracker.get_config()
 
+    elif name == "get_tunable_params":
+        return {"params": tracker.get_tunable_params()}
+
     elif name == "list_metrics":
         return {"metrics": tracker.get_metric_names()}
 
@@ -179,27 +210,7 @@ def _handle_tool(name: str, arguments: dict) -> dict:
 
     # ── Intervene ──
     elif name == "adjust_param":
-        param_name = arguments["name"]
-        value = arguments["value"]
-        reason = arguments.get("reason", "")
-
-        # Guardrail check
-        check = guardrails.validate_adjustment(param_name, value, reason)
-        if not check["allowed"]:
-            return {"status": "blocked", "error": check["error"]}
-
-        # Record and apply
-        guardrails.record_intervention(
-            action="adjust_param", param=param_name,
-            old_value=check.get("old_value"), new_value=value, reason=reason,
-        )
-        tracker.set_override(param_name, value)
-
-        result = {"status": "applied", "param": param_name, "old_value": check.get("old_value"),
-                  "new_value": value, "reason": reason}
-        if check.get("warnings"):
-            result["warnings"] = check["warnings"]
-        return result
+        return _adjust_param(arguments["name"], arguments["value"], arguments.get("reason", ""))
 
     elif name == "save_checkpoint":
         tag = arguments["tag"]
@@ -235,6 +246,22 @@ def _handle_tool(name: str, arguments: dict) -> dict:
         guardrails.record_intervention(action="pause", reason="agent requested")
         return {"status": "paused"}
 
+    elif name == "run_eval":
+        eval_request = {
+            "id": f"eval-{int(time.time() * 1000)}",
+            "episodes": arguments.get("episodes", 100),
+            "tag": arguments.get("tag", ""),
+            "reason": arguments.get("reason", ""),
+        }
+        tracker.set_override("__run_eval__", eval_request)
+        guardrails.record_intervention(
+            action="run_eval",
+            param=eval_request["tag"] or eval_request["id"],
+            new_value=eval_request["episodes"],
+            reason=eval_request["reason"] or "agent requested",
+        )
+        return {"status": "queued", "request": eval_request}
+
     elif name == "resume_training":
         tracker.set_override("__resume__", True)
         guardrails.record_intervention(action="resume", reason="agent requested")
@@ -248,8 +275,38 @@ def _handle_tool(name: str, arguments: dict) -> dict:
     elif name == "get_guardrail_status":
         return guardrails.get_summary()
 
+    elif name == "get_eval_runs":
+        last_n = arguments.get("last_n", 0)
+        return {"eval_runs": tracker.get_eval_runs(last_n)}
+
     else:
         return {"error": f"Unknown tool: {name}"}
+
+
+def _adjust_param(param_name: str, value: float, reason: str) -> dict:
+    check = guardrails.validate_adjustment(param_name, value, reason)
+    if not check["allowed"]:
+        result = {"status": "blocked", "error": check["error"]}
+        if "allowed_params" in check:
+            result["allowed_params"] = check["allowed_params"]
+        return result
+
+    guardrails.record_intervention(
+        action="adjust_param", param=param_name,
+        old_value=check.get("old_value"), new_value=value, reason=reason,
+    )
+    tracker.set_override(param_name, value)
+
+    result = {
+        "status": "applied",
+        "param": param_name,
+        "old_value": check.get("old_value"),
+        "new_value": value,
+        "reason": reason,
+    }
+    if check.get("warnings"):
+        result["warnings"] = check["warnings"]
+    return result
 
 
 # ──────────────────────────────────────────────────────────────
